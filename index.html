@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ボム兵を分けろ！（マリオのゲーム）</title>
+<style>
+  :root{
+    --bg:#0b1116; --panel:#0f1720; --red:#ff6b81;
+  }
+  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN";}
+  body{background:linear-gradient(180deg,#061017,#07121a);color:#fff;display:flex;align-items:center;justify-content:center;padding:18px}
+  .wrap{width:min(980px,96vw);display:flex;gap:16px;align-items:flex-start}
+  canvas{border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,.6);background:linear-gradient(180deg,#06202a,#04121a);display:block}
+  .panel{width:320px;padding:14px;border-radius:10px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));}
+  h2{margin:0 0 8px 0;font-size:18px}
+  .btn{display:inline-block;background:#ffd24a;color:#07121b;padding:8px 12px;border-radius:8px;font-weight:700;cursor:pointer;margin:6px 0}
+  .mutebtn{background:transparent;border:1px solid rgba(255,255,255,0.06);color:#fff;padding:6px 8px;border-radius:8px;cursor:pointer}
+  .stat{margin:8px 0;font-size:14px}
+  .small{font-size:13px;color:#cbd5e1}
+  .zone-swatch{height:40px;border-radius:8px;margin-top:8px;display:flex;overflow:hidden}
+  .zone{flex:1;display:flex;align-items:center;justify-content:center;font-weight:700}
+  .note{font-size:12px;color:#9aa8b8;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div>
+    <canvas id="game" width="760" height="520"></canvas>
+  </div>
+  <div class="panel">
+    <h2>ボム兵を分けろ！</h2>
+    <div class="stat">Time: <span id="time">45</span>s</div>
+    <div class="stat">Score: <span id="score">0</span></div>
+    <div class="stat">Combo: <span id="combo">0</span></div>
+    <div style="margin-top:8px">
+      <div id="startBtn" class="btn">START</div>
+      <button id="muteBtn" class="mutebtn">🔊 音: ON</button>
+    </div>
+    <div class="zone-swatch">
+      <div class="zone" style="background:linear-gradient(180deg,#ee3850)">赤ゾーン</div>
+      <div class="zone" style="background:linear-gradient(180deg,#3c3b3b)">黒ゾーン</div>
+    </div>
+    <div class="small" style="margin-top:10px">操作：タッチ / クリックで掴んでドラッグして仕分け。誤って逆のゾーンへ入れると即ゲームオーバー。</div>
+  </div>
+</div>
+
+<script>
+/*
+  シンプル化の方針（機能は変更なし）：
+  - 変数名を整理して読みやすく
+  - 大きな機能ブロックに説明コメント（Bomb, Particle, spawn, 入力, ループ）
+  - 冗長なコードを統合（効果音・UI更新など）
+*/
+
+// ====== 基本セットアップ ======
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// UI 要素参照
+const timeEl = document.getElementById('time');
+const scoreEl = document.getElementById('score');
+const comboEl = document.getElementById('combo');
+const startBtn = document.getElementById('startBtn');
+const muteBtn = document.getElementById('muteBtn');
+
+let running = false;
+let lastTs = 0;
+
+// ゲーム状態
+let timeLeft = 45;
+const INIT_TIME = 45;
+let score = 0;
+let combo = 0;
+let maxCombo = 0;
+
+let bombs = [];      // Bomb インスタンス一覧
+let particles = [];  // Particle インスタンス一覧
+
+const zone = { // 下部の仕分けゾーン（左=赤, 右=黒）
+  red: { x: 0, y: H - 120, w: W / 2, h: 120 },
+  black: { x: W / 2, y: H - 120, w: W / 2, h: 120 }
+};
+
+// 難易度・スポーン管理
+let spawnTimer = 0;
+let difficultyProgress = 0; // 0..1
+
+// 音（簡易）
+let mute = false;
+const AudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playBeep(freq=880, dur=0.06, type='sine', vol=0.06){
+  if (mute) return;
+  const o = AudioCtx.createOscillator();
+  const g = AudioCtx.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.value = vol;
+  o.connect(g); g.connect(AudioCtx.destination);
+  o.start(); o.stop(AudioCtx.currentTime + dur);
+}
+function playBoom(){
+  if (mute) return;
+  const o = AudioCtx.createOscillator();
+  const g = AudioCtx.createGain();
+  o.type = 'sawtooth';
+  o.frequency.setValueAtTime(150, AudioCtx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(40, AudioCtx.currentTime + 0.2);
+  g.gain.setValueAtTime(0.12, AudioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AudioCtx.currentTime + 0.6);
+  o.connect(g); g.connect(AudioCtx.destination);
+  o.start(); o.stop(AudioCtx.currentTime + 0.6);
+}
+
+// ====== ヘルパー ======
+const rand = (a,b) => Math.random()*(b-a)+a;
+const clamp = (v,min,max) => Math.max(min, Math.min(max, v));
+
+// ====== Bomb クラス（ランダム移動＋fuse） ======
+class Bomb {
+  constructor(kind){
+    this.kind = kind; // 'red' or 'black'
+    this.radius = 26;
+    this.x = rand(80, W - 80);
+    this.y = rand(20, H/3);
+    // ランダム初速（どの方向にも飛ぶ）
+    const ang = Math.random()*Math.PI*2;
+    const sp = rand(10, 60);
+    this.vx = Math.cos(ang)*sp;
+    this.vy = Math.sin(ang)*sp;
+    // fuse（秒）
+    this._seed = Math.random()*1000;
+    this._wiggle = rand(0.6,1.6);
+    this.maxFuse = rand(7, 8.5);
+    this.fuse = this.maxFuse;
+    this.grabbed = false;
+    this.offsetX = 0; this.offsetY = 0;
+    this.alive = true;
+    this.mark = Math.random() < 0.08 ? 'fast' : null; // 特別に速い個体
+  }
+
+  update(dt){
+    if (!this.grabbed){
+      // 風・ランダム加速度で画面内をうろつかせる
+      const t = performance.now()*0.001 + this._seed;
+      const ax = Math.sin(t*1.2 + this._seed)*18 * this._wiggle + (Math.random()-0.5)*12;
+      const ay = Math.cos(t*0.7 + this._seed)*10 * this._wiggle + 6;
+      this.vx += ax * dt;
+      this.vy += ay * dt;
+
+      // 速度制限と位置更新
+      const speed = Math.hypot(this.vx, this.vy);
+      const maxSpeed = 220;
+      if (speed > maxSpeed){
+        const s = maxSpeed / speed;
+        this.vx *= s; this.vy *= s;
+      }
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+
+      // 摩擦・画面端反射
+      this.vx *= 0.995; this.vy *= 0.998;
+      if (this.x - this.radius < 6){ this.x = this.radius + 6; this.vx *= -0.7; }
+      if (this.x + this.radius > W - 6){ this.x = W - this.radius - 6; this.vx *= -0.7; }
+      if (this.y - this.radius < 6){ this.y = this.radius + 6; this.vy *= -0.7; }
+      if (this.y + this.radius > H - 30){ this.y = H - 30 - this.radius; this.vy *= -0.6; }
+    }
+    // fuse 減少（掴まれていると少し遅くなる。'fast'ならさらに早い）
+    this.fuse -= dt * (this.grabbed ? 0.75 : 1.0) * (this.mark === 'fast' ? 1.6 : 1.0);
+    if (this.fuse <= 0) {
+      this.fuse = 0;
+      this.explode();
+    }
+  }
+
+    draw(ctx){
+  ctx.save();
+  ctx.translate(this.x, this.y);
+
+  // --- 本体（単色） ---
+  ctx.beginPath();
+  ctx.fillStyle = (this.kind === 'red') ? '#ff6b81' : '#333';
+  ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- 目（左右同じ・自然な位置） ---
+  ctx.fillStyle = '#fff';
+  // 左目
+  ctx.beginPath();
+  ctx.arc(-8, -4, 4, 0, Math.PI * 2);
+  ctx.fill();
+  // 右目
+  ctx.beginPath();
+  ctx.arc(8, -4, 4, 0, Math.PI * 2);
+  ctx.fill();
+  
+  // 黒目
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(-8, -4, 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(8, -4, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- fuse（導火線：超シンプル） ---
+  const fx = 10, fy = -this.radius - 4;
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(fx, fy);
+  ctx.lineTo(fx, fy - 16);
+  ctx.stroke();
+
+  // 小さな炎（単色・シンプル）
+  const flameY = fy - 18;
+  ctx.fillStyle = (this.fuse / this.maxFuse < 0.3) ? '#ff4500' : '#ffaa00';
+  ctx.beginPath();
+  ctx.arc(fx, flameY, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- fuseバー（残り時間） ---
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.fillRect(-18, this.radius + 8, 36, 6);
+  ctx.fillStyle = (this.fuse / this.maxFuse < 0.3) ? '#ff8844' : '#7cffc5';
+  ctx.fillRect(-18, this.radius + 8, 36 * (this.fuse / this.maxFuse), 6);
+
+
+  ctx.restore();
+}
+
+
+  explode(){
+    if (!this.alive) return;
+    this.alive = false;
+    spawnExplosion(this.x, this.y, this.kind);
+    playBoom();
+    endGame('爆発した！');
+  }
+}
+
+// ====== Particle（爆発・得点エフェクト） ======
+class Particle {
+  constructor(x,y,vx,vy,life,size,color){
+    this.x=x; this.y=y; this.vx=vx; this.vy=vy; this.life=life; this.maxLife=life; this.size=size; this.color=color;
+  }
+  update(dt){
+    this.life -= dt;
+    this.vy += 80 * dt; // 少し落ちる
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.vx *= 0.99;
+  }
+  draw(ctx){
+    const t = Math.max(0, this.life / this.maxLife);
+    ctx.globalAlpha = t;
+    ctx.beginPath(); ctx.arc(this.x, this.y, this.size * t, 0, Math.PI*2); ctx.fillStyle = this.color; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function spawnExplosion(x,y,kind){
+  for (let i=0;i<30;i++){
+    const a = Math.random()*Math.PI*2;
+    const s = Math.random()*240 + 40;
+    const vx = Math.cos(a)*s*0.02, vy = Math.sin(a)*s*0.02 - Math.random()*2;
+    const col = (kind === 'red') ? `rgba(255,120,140,${1-Math.random()*0.3})` : `rgba(200,200,200,${1-Math.random()*0.3})`;
+    particles.push(new Particle(x,y,vx,vy,0.7+Math.random()*0.6, rand(3,7), col));
+  }
+}
+
+// ====== スポーン（難易度依存） ======
+function spawnBomb(){
+  const kind = (Math.random() < 0.5) ? 'red' : 'black';
+  const b = new Bomb(kind);
+  // 進行度で fuse を若干短縮（元ロジックを維持）
+  b.maxFuse *= clamp(1 - difficultyProgress*0.45, 0.5, 1.2);
+  b.fuse = b.maxFuse;
+  if (Math.random() < 0.08 + difficultyProgress*0.18) b.mark = 'fast';
+  bombs.push(b);
+}
+
+// ====== 入力（マウス／タッチで掴む・ドラッグ） ======
+let pointer = {down:false, id:null, x:0, y:0, grabbed:null};
+
+function getPointerPos(e){
+  const rect = canvas.getBoundingClientRect();
+  if (e.touches && e.touches.length){
+    return {x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top, id: e.touches[0].identifier};
+  } else {
+    return {x: e.clientX - rect.left, y: e.clientY - rect.top, id: 'mouse'};
+  }
+}
+
+function grabAt(px, py){
+  // 上にあるものほど優先（後ろ→前の順に探す）
+  for (let i = bombs.length - 1; i >= 0; i--){
+    const b = bombs[i];
+    if (!b.alive) continue;
+    const d = Math.hypot(b.x - px, b.y - py);
+    if (d <= b.radius + 12){
+      b.grabbed = true;
+      b.offsetX = b.x - px; b.offsetY = b.y - py;
+      pointer.grabbed = b;
+      playBeep(900,0.04,'sine',0.06);
+      return;
+    }
+  }
+}
+
+function releaseGrab(){
+  if (!pointer.grabbed) return;
+  const b = pointer.grabbed;
+  b.grabbed = false;
+  // 投げる勢いを与える（簡易）
+  b.vx = (pointer.x - (b.x - b.offsetX)) * 8;
+  b.vy = (pointer.y - (b.y - b.offsetY)) * 8 - 40;
+  pointer.grabbed = null;
+}
+
+// イベント接続（マウス）
+canvas.addEventListener('mousedown', (e)=>{
+  if (!running) return;
+  const p = getPointerPos(e);
+  pointer.down = true; pointer.x = p.x; pointer.y = p.y; pointer.id = p.id;
+  grabAt(p.x, p.y);
+});
+canvas.addEventListener('mousemove', (e)=>{
+  const p = getPointerPos(e);
+  pointer.x = p.x; pointer.y = p.y;
+  if (pointer.down && pointer.grabbed){
+    // 掴んでいるボムの位置を直接更新（ドラッグ）
+    pointer.grabbed.x = pointer.x + pointer.grabbed.offsetX;
+    pointer.grabbed.y = pointer.y + pointer.grabbed.offsetY;
+  }
+});
+canvas.addEventListener('mouseup', ()=>{
+  pointer.down = false; releaseGrab();
+});
+
+// タッチ対応（preventDefault でスクロール防止）
+canvas.addEventListener('touchstart', (e)=>{
+  e.preventDefault();
+  if (!running) return;
+  const p = getPointerPos(e);
+  pointer.down = true; pointer.x = p.x; pointer.y = p.y; pointer.id = p.id;
+  grabAt(p.x, p.y);
+}, {passive:false});
+canvas.addEventListener('touchmove', (e)=>{
+  e.preventDefault();
+  const p = getPointerPos(e);
+  pointer.x = p.x; pointer.y = p.y;
+  if (pointer.down && pointer.grabbed){
+    pointer.grabbed.x = pointer.x + pointer.grabbed.offsetX;
+    pointer.grabbed.y = pointer.y + pointer.grabbed.offsetY;
+  }
+}, {passive:false});
+canvas.addEventListener('touchend', (e)=>{
+  e.preventDefault();
+  pointer.down = false; releaseGrab();
+}, {passive:false});
+
+// ====== 判定（ゾーンへの入場と正誤処理） ======
+function checkZoneEntry(b){
+  if (!b.alive) return;
+  // ボムがゾーン領域へ入ったら判定
+  if (b.y + b.radius > zone.red.y + 8){
+    if (b.x < W/2){
+      b.kind === 'red' ? handleCorrect(b) : handleWrong(b);
+    } else {
+      b.kind === 'black' ? handleCorrect(b) : handleWrong(b);
+    }
+  }
+}
+
+function handleCorrect(b){
+  if (!b.alive) return;
+  b.alive = false;
+  combo = combo + 1;
+  maxCombo = Math.max(maxCombo, combo);
+  const base = 10;
+  const gained = Math.round(base * (1 + Math.min(combo, 12) * 0.18));
+  score += gained;
+  timeLeft += 1.2 + Math.min(2.5, combo*0.18);
+
+  // 得点パーティクル
+  for (let i=0;i<18;i++){
+    const a = Math.random()*Math.PI*2;
+    const s = Math.random()*120;
+    const vx = Math.cos(a)*s*0.02, vy = Math.sin(a)*s*0.02 - Math.random()*1.5;
+    const col = (b.kind==='red')? `rgba(255,120,140,0.9)` : `rgba(240,240,240,0.9)`;
+    particles.push(new Particle(b.x, b.y, vx, vy, 0.6+Math.random()*0.6, rand(2,6), col));
+  }
+
+  playBeep(1000 - Math.min(400,combo*20), 0.06, 'sine', 0.06);
+  updateUI();
+}
+
+function handleWrong(b){
+  b.alive = false;
+
+  // 間違いの派手なパーティクル
+  for (let i=0;i<28;i++){
+    const a = Math.random()*Math.PI*2;
+    const s = Math.random()*260;
+    const vx = Math.cos(a)*s*0.02, vy = Math.sin(a)*s*0.02 - Math.random()*2;
+    particles.push(new Particle(b.x, b.y, vx, vy, 0.8+Math.random()*0.6, rand(3,7), 'rgba(255,80,80,0.95)'));
+  }
+
+  showOverlayText('間違った仕分け！');
+  playBoom();
+  endGame('間違った仕分けでゲームオーバー');
+}
+
+// ====== UI / ゲームオーバー ======
+function updateUI(){
+  timeEl.textContent = Math.ceil(timeLeft);
+  scoreEl.textContent = score;
+  comboEl.textContent = Math.floor(combo);
+}
+function endGame(reason){
+  if (!running) return;
+  running = false;
+  showOverlayText(`ゲームオーバー！ ${reason}`);
+}
+
+
+// ====== 描画 ======
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  // 下部のゾーン背景
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.fillRect(0, zone.red.y - 8, W, zone.red.h + 8);
+
+  // 赤ゾーン（左）と黒ゾーン（右）を描く
+  ctx.save();
+  const g1 = ctx.createLinearGradient(0, zone.red.y, 0, H);
+  g1.addColorStop(0,'#ee3850'); g1.addColorStop(1,'#ee3850');
+  ctx.fillStyle = g1;
+  ctx.fillRect(zone.red.x, zone.red.y, zone.red.w, zone.red.h);
+
+  const g2 = ctx.createLinearGradient(W/2, zone.black.y, W/2, H);
+  g2.addColorStop(0,'#3c3b3b'); g2.addColorStop(1,'#3c3b3b');
+  ctx.fillStyle = g2;
+  ctx.fillRect(zone.black.x, zone.black.y, zone.black.w, zone.black.h);
+  ctx.restore();
+
+  // ラベル
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('赤ゾーン', zone.red.w/2, zone.red.y + 36);
+  ctx.fillText('黒ゾーン', W/2 + zone.black.w/2, zone.black.y + 36);
+
+  // パーティクル→ボムの順で描画
+  for (let p of particles) p.draw(ctx);
+  for (let b of bombs) b.draw(ctx);
+
+  // UI 上の小さな表示
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = '18px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(`Time: ${Math.ceil(timeLeft)}s`, 12, 24);
+  ctx.textAlign = 'right';
+  ctx.fillText(`Score: ${score}`, W - 12, 24);
+
+  if (combo >= 2){
+    ctx.font = 'bold 30px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,240,140,0.95)';
+    ctx.fillText(`COMBO ×${Math.floor(combo)}`, W/2, 60);
+  }
+}
+
+// ====== メインループ（更新・スポーン・クリーンアップ） ======
+function loop(ts){
+  if (!lastTs) lastTs = ts;
+  const dt = Math.min(0.05, (ts - lastTs)/1000);
+  lastTs = ts;
+
+  if (running){
+    // 経過に応じた進行度（0..1）
+    const elapsed = Math.max(0, INIT_TIME - timeLeft);
+    difficultyProgress = clamp(elapsed / (INIT_TIME + 10), 0, 1);
+
+    // スポーン間隔と同時出現数を進行度で増やす
+    spawnTimer -= dt;
+    const maxInterval = clamp(1.2 - difficultyProgress*0.9, 0.4, 1.2);
+    if (spawnTimer <= 0){
+      spawnTimer = maxInterval * (0.75 + Math.random()*0.5);
+      const spawnCount = 1 + Math.floor(difficultyProgress * 2.4); // 1..3
+      const maxSimultaneous = 5 + Math.floor(difficultyProgress * 12); // 5..17
+      for (let i=0;i<spawnCount;i++){
+        if (bombs.length < maxSimultaneous) spawnBomb();
+      }
+    }
+
+    // 更新
+    bombs.forEach(b => { if (b.alive) b.update(dt); });
+    particles.forEach(p => p.update(dt));
+
+    // ゾーン判定（下に近いボムのみ判定）
+    for (let b of bombs){
+      if (b.alive && b.y + b.radius > zone.red.y + 8){
+        checkZoneEntry(b);
+      }
+    }
+
+    // クリーンアップ
+    bombs = bombs.filter(b => b.alive);
+    particles = particles.filter(p => p.life > 0);
+
+    // 時間減少・コンボ減衰
+    timeLeft -= dt;
+    if (timeLeft <= 0){ timeLeft = 0; endGame('時間切れで爆発！'); }
+
+    combo = Math.max(0, combo - dt * 0.6);  
+    updateUI();
+  }
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ====== 簡易オーバーレイテキスト表示 ======
+let overlayText = null;
+function showOverlayText(txt){
+  overlayText = txt;
+  // 簡単に一度だけ描画（元コードに近いフェードは非複雑化のため簡易実装）
+  ctx.save();
+  ctx.globalAlpha = 0.95;
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 28px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(overlayText, W/2, H/2);
+  ctx.restore();
+  // 画面上のテキストは次のフレームで消える（必要ならフェードロジック追加可）
+  setTimeout(()=>{ overlayText = null; }, 700);
+}
+
+// ====== UI ハンドラ（開始・ミュート） ======
+startBtn.addEventListener('click', ()=>{
+  if (AudioCtx.state === 'suspended') AudioCtx.resume();
+  startGame();
+});
+muteBtn.addEventListener('click', ()=>{
+  mute = !mute;
+  muteBtn.textContent = mute ? '🔇 音: OFF' : '🔊 音: ON';
+});
+
+// ====== ゲーム開始 / リセット ======
+function startGame(){
+  bombs = []; particles = [];
+  timeLeft = INIT_TIME; score = 0; combo = 0; maxCombo = 0;
+  spawnTimer = 0.2;
+  running = true;
+  lastTs = 0;
+  updateUI();
+  // 最初に少数スポーン
+  for (let i=0;i<2;i++) spawnBomb();
+  requestAnimationFrame(loop);
+}
+
+// 初期描画
+draw();
+</script>
+</body>
+</html>
