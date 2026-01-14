@@ -8,7 +8,6 @@
     <style>
         :root {
             --bg: #0e0e0e;
-            --panel: #0f1720;
             --red: #ff6b81;
         }
 
@@ -23,8 +22,7 @@
             color: #fff;
             display: flex;
             align-items: center;
-            justify-content: center;
-            padding: 18px
+            justify-content: center; 
         }
 
         .wrap {
@@ -102,8 +100,8 @@
             </div>
 
             <div class="zone-swatch">
-                <div class="zone" style="background:#ee3850;">赤ゾーン</div>
-                <div class="zone" style="background:#333;">黒ゾーン</div>
+                <div class="zone" style="background:#ee3850;">赤</div>
+                <div class="zone" style="background:#333;">黒</div>
             </div>
 
             <div class="small">操作：タッチ / クリックで掴んでドラッグして仕分け。誤って逆のゾーンへ入れると即ゲームオーバー。</div>
@@ -112,9 +110,19 @@
 
     <!-- ここにスクリプトは1回だけ -->
     <script>
-        /* コンパクト版スクリプト（重複を削った一つのスクリプト） */
-        const canvas = document.getElementById('game');
-        const ctx = canvas.getContext('2d');
+        /* canvas と ctx：2D 描画コンテキストを取得。
+            W, H：キャンバスの幅・高さを変数に。以降の座標計算はこれをベースに行う。
+            timeEl 等：HTML のスコア/時間表示要素を JS で操作するために取得。
+            続く状態変数：
+            running（ゲーム中かどうか）
+            lastTs（前フレームの timestamp、ループ内で差分を取る）
+            timeLeft, score, combo：ゲーム状態
+            zone：下部の仕分け領域（赤ゾーンと黒ゾーン）の矩形情報
+            bombs：画面上の爆弾オブジェクト配列
+            spawnTimer：次のスポーンまでの待ち時間 */
+        const canvas = document.getElementById('game'); 
+        /* document.getElementByIdの意味は、HTML内の特定のIDを持つ要素をJavaScriptで取得すること */
+        const ctx = canvas.getContext('2d'); /* ctxは2D描画コンテキスト */
         const W = canvas.width, H = canvas.height;
         const timeEl = document.getElementById('time');
         const scoreEl = document.getElementById('score');
@@ -128,20 +136,26 @@
         let bombs = [];
         let spawnTimer = 0.2;
 
+        /* ランダムな数値を生成する関数と、値を範囲内にクランプする関数 
+        クランプとは、指定された範囲内に値を制限すること */
         const rand = (a, b) => Math.random() * (b - a) + a;
         const clamp = (v, m, M) => Math.max(m, Math.min(M, v));
 
         class Bomb {
             constructor(kind) {
-                this.kind = kind;
-                this.r = 26;
+                this.kind = kind; // 'red' または 'black'
+                this.r = 26; // 半径
                 this.x = rand(80, W - 80); this.y = rand(20, H / 3);
-                const ang = Math.random() * Math.PI * 2, sp = rand(20, 80);
-                this.vx = Math.cos(ang) * sp; this.vy = Math.sin(ang) * sp;
-                this.fuse = rand(6.5, 8.5);
-                this.alive = true; this.grabbed = false; this.offsetX = 0; this.offsetY = 0;
+                const ang = Math.random() * Math.PI * 2, sp = rand(20, 80); // 初速
+                this.vx = Math.cos(ang) * sp; this.vy = Math.sin(ang) * sp; // 速度ベクトル
+                this.fuse = rand(6.5, 8.5); // 導火線の長さ（秒）
+                this.alive = true; this.grabbed = false; this.offsetX = 0; this.offsetY = 0; // 掴まれているかどうか
             }
             update(dt) {
+                // dt は前フレームからの経過時間（秒）
+                // 掴まれていなければ物理挙動、掴まれていれば導火線の減りが遅くなる
+                // 掴まれていない場合、重力加速度を加え、位置を更新し、摩擦で速度を減衰させる
+                // 壁との衝突判定も行う
                 if (!this.grabbed) {
                     this.vy += 40 * dt;
                     this.x += this.vx * dt; this.y += this.vy * dt;
@@ -151,20 +165,24 @@
                     if (this.y - this.r < 6) { this.y = this.r + 6; this.vy *= -0.6; }
                     if (this.y + this.r > H - 30) { this.y = H - 30 - this.r; this.vy *= -0.6; }
                 } else {
-                    this.fuse -= dt * 0.6;
+                    this.fuse -= dt * 0.6; // 掴まれているときは導火線の減りが遅い
                 }
                 this.fuse -= dt * (this.grabbed ? 0.2 : 1.0);
                 if (this.fuse <= 0) { this.fuse = 0; this.explode(); }
             }
+            
             draw(ctx) {
-                ctx.save(); ctx.translate(this.x, this.y);
+                ctx.save(); //saveは現在の描画状態を保存
+                ctx.translate(this.x, this.y);  //translateは座標変換
                 ctx.fillStyle = (this.kind === 'red') ? '#ff6b81' : '#333';
-                ctx.beginPath(); ctx.arc(0, 0, this.r, 0, Math.PI * 2); ctx.fill();
+                ctx.beginPath(); ctx.arc(0, 0, this.r, 0, Math.PI * 2); ctx.fill(); //biginPathは新しいパスを開始
                 ctx.fillStyle = '#000a'; ctx.fillRect(-24, this.r + 6, 48, 6);
                 ctx.fillStyle = this.fuse / 8 < 0.3 ? '#ff8844' : '#7cffc5';
-                ctx.fillRect(-24, this.r + 6, 48 * (this.fuse / 8), 6);
-                ctx.restore();
+                ctx.fillRect(-24, this.r + 6, 48 * (this.fuse / 8), 6); //導火線
+                ctx.restore(); //restoreは保存された描画状態を復元
             }
+
+            //explodeメソッドは、爆弾が爆発したときの処理を行う
             explode() {
                 if (!this.alive) return;
                 this.alive = false;
@@ -172,14 +190,23 @@
             }
         }
 
-        function spawnBomb() { bombs.push(new Bomb(Math.random() < 0.5 ? 'red' : 'black')); }
+        // 爆弾をスポーンさせる関数。
+        // スポーンとは、新しい爆弾オブジェクトを作成して画面に追加すること
+        function spawnBomb() { 
+            bombs.push(new Bomb(Math.random() < 0.5 ? 'red' : 'black')); 
+        }
 
+        //pointerオブジェクトは、現在のポインター（マウスまたはタッチ）の状態を管理する
         let pointer = { down: false, x: 0, y: 0, grabbed: null };
+
+        // getPointerPos関数は、マウスまたはタッチイベントからポインターの位置を取得する
         function getPointerPos(e) {
             const r = canvas.getBoundingClientRect();
             if (e.touches && e.touches.length) return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top, id: e.touches[0].identifier };
             return { x: e.clientX - r.left, y: e.clientY - r.top, id: 'mouse' };
         }
+
+        // grabAt関数は、指定された位置にある爆弾を掴む処理を行う
         function grabAt(px, py) {
             for (let i = bombs.length - 1; i >= 0; i--) {
                 const b = bombs[i]; if (!b.alive) continue;
@@ -187,6 +214,8 @@
                 if (d <= b.r + 12) { b.grabbed = true; b.offsetX = b.x - px; b.offsetY = b.y - py; pointer.grabbed = b; return; }
             }
         }
+
+        // releaseGrab関数は、掴んでいる爆弾を放す処理を行う
         function releaseGrab() {
             if (!pointer.grabbed) return;
             const b = pointer.grabbed;
@@ -196,14 +225,21 @@
             pointer.grabbed = null;
         }
 
+        /* イベントリスナーの登録：
+        mousedown/touchstart：ポインターが押されたときに呼ばれる
+        mousemove/touchmove：ポインターが動いたときに呼ばれる
+        mouseup/touchend：ポインターが離されたときに呼ばれる */
         canvas.addEventListener('mousedown', (e) => { if (!running) return; const p = getPointerPos(e); pointer.down = true; pointer.x = p.x; pointer.y = p.y; grabAt(p.x, p.y); });
         canvas.addEventListener('mousemove', (e) => { const p = getPointerPos(e); pointer.x = p.x; pointer.y = p.y; if (pointer.down && pointer.grabbed) { pointer.grabbed.x = pointer.x + pointer.grabbed.offsetX; pointer.grabbed.y = pointer.y + pointer.grabbed.offsetY; } });
         canvas.addEventListener('mouseup', () => { pointer.down = false; releaseGrab(); });
 
+        /* タッチイベントの場合、
+        デフォルトのスクロール動作を防ぐためにe.preventDefault()を呼び出す */  
         canvas.addEventListener('touchstart', (e) => { e.preventDefault(); if (!running) return; const p = getPointerPos(e); pointer.down = true; pointer.x = p.x; pointer.y = p.y; grabAt(p.x, p.y); }, { passive: false });
         canvas.addEventListener('touchmove', (e) => { e.preventDefault(); const p = getPointerPos(e); pointer.x = p.x; pointer.y = p.y; if (pointer.down && pointer.grabbed) { pointer.grabbed.x = pointer.x + pointer.grabbed.offsetX; pointer.grabbed.y = pointer.y + pointer.grabbed.offsetY; } }, { passive: false });
         canvas.addEventListener('touchend', (e) => { e.preventDefault(); pointer.down = false; releaseGrab(); }, { passive: false });
 
+        /* ゾーンへの侵入チェックと処理関数群 */
         function checkZoneEntry(b) {
             if (!b.alive) return;
             if (b.y + b.r > zone.red.y + 8) {
@@ -211,17 +247,30 @@
                 else { b.kind === 'black' ? handleCorrect(b) : handleWrong(b); }
             }
         }
+
+        /* 正しいゾーンに入れた場合と間違ったゾーンに入れた場合の処理 */
         function handleCorrect(b) {
             if (!b.alive) return;
             b.alive = false;
             combo = combo + 1; score += 10 + Math.floor(combo * 2); updateUI();
         }
+
+        /* 間違ったゾーンに入れた場合はゲームオーバー */
         function handleWrong(b) {
             b.alive = false; endGame('間違った仕分けでゲームオーバー');
         }
 
-        function updateUI() { timeEl.textContent = Math.ceil(timeLeft); scoreEl.textContent = score; comboEl.textContent = Math.floor(combo); }
-        function endGame(reason) { if (!running) return; running = false; alert('ゲームオーバー: ' + reason); }
+        function updateUI() { 
+            timeEl.textContent = Math.ceil(timeLeft); 
+            scoreEl.textContent = score; 
+            comboEl.textContent = Math.floor(combo); 
+        }
+
+        function endGame(reason) { 
+            if (!running) return; 
+            running = false; 
+            alert('ゲームオーバー: ' + reason); 
+        }
 
         function draw() {
             ctx.clearRect(0, 0, W, H);
